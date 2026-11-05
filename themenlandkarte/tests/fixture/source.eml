@@ -1,0 +1,7 @@
+From: fixture@example.invalid
+To: fixture@example.invalid
+Subject: Synthetic connector source
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Synthetic source. Its contents must not be extracted by the topic indexer.
