@@ -23,7 +23,8 @@ function Save-ReaderHistory([string]$Directory, [hashtable]$Documents, [string]$
 }
 
 function Stop-ReaderWatcher {
-    if ($script:directoryWatcher) { $script:directoryWatcher.EnableRaisingEvents = $false; $script:directoryWatcher.Dispose(); $script:directoryWatcher = $null }
+    foreach ($watcher in @($script:directoryWatcher)) { if ($watcher) { $watcher.EnableRaisingEvents = $false; $watcher.Dispose() } }
+    $script:directoryWatcher = $null
     foreach ($eventId in @($script:watchEventIds)) {
         Unregister-Event -SourceIdentifier $eventId -ErrorAction SilentlyContinue
         Get-Event -SourceIdentifier $eventId -ErrorAction SilentlyContinue | Remove-Event -ErrorAction SilentlyContinue
@@ -33,17 +34,26 @@ function Stop-ReaderWatcher {
 
 function Start-ReaderWatcher {
     Stop-ReaderWatcher
-    $script:directoryWatcher = [IO.FileSystemWatcher]::new($script:Root)
-    $script:directoryWatcher.IncludeSubdirectories = $true
-    $script:directoryWatcher.NotifyFilter = [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::DirectoryName -bor [IO.NotifyFilters]::Size
-    $script:directoryWatcher.InternalBufferSize = 32768
+    $script:directoryWatcher = @()
     $script:watchEventIds = @()
-    foreach ($eventName in @('Changed', 'Created', 'Deleted', 'Renamed', 'Error')) {
-        $eventId = 'ai-os-reader-' + [guid]::NewGuid().ToString('N')
-        Register-ObjectEvent -InputObject $script:directoryWatcher -EventName $eventName -SourceIdentifier $eventId | Out-Null
-        $script:watchEventIds += $eventId
+    $script:watchPrefixes = @{}
+    foreach ($source in @($script:sourceConfiguration.sources)) {
+        if (-not $source.path) { continue }
+        if ((Get-SourceProbe $source).reachable -ne 'reachable') { continue }
+        $prefix = Get-SourcePrefix $source
+        $watcher = [IO.FileSystemWatcher]::new($source.path)
+        $watcher.IncludeSubdirectories = $true
+        $watcher.NotifyFilter = [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::DirectoryName -bor [IO.NotifyFilters]::Size
+        $watcher.InternalBufferSize = 32768
+        foreach ($eventName in @('Changed', 'Created', 'Deleted', 'Renamed', 'Error')) {
+            $eventId = 'ai-os-reader-' + [guid]::NewGuid().ToString('N')
+            Register-ObjectEvent -InputObject $watcher -EventName $eventName -SourceIdentifier $eventId | Out-Null
+            $script:watchEventIds += $eventId
+            $script:watchPrefixes[$eventId] = $prefix
+        }
+        $watcher.EnableRaisingEvents = $true
+        $script:directoryWatcher += $watcher
     }
-    $script:directoryWatcher.EnableRaisingEvents = $true
 }
 
 function Get-ReaderFileState([string]$Path) {
@@ -78,7 +88,7 @@ function Check-ReaderChanges([string]$DocumentPath) {
                 foreach ($name in @($event.SourceEventArgs.Name, $event.SourceEventArgs.OldName)) {
                     if (-not $name) { continue }
                     $relative = $name.Replace('\', '/')
-                    if ($relative -notmatch '(^|/)(\.git|node_modules|\.venv|venv|__pycache__|themenlandkarte)(/|$)') { $paths.Add($relative) | Out-Null }
+                    if ($relative -notmatch '(^|/)(\.git|node_modules|\.venv|venv|__pycache__|themenlandkarte)(/|$)') { $paths.Add([string]$script:watchPrefixes[$eventId] + $relative) | Out-Null }
                 }
             }
             Remove-Event -EventIdentifier $event.EventIdentifier -ErrorAction SilentlyContinue
@@ -89,6 +99,7 @@ function Check-ReaderChanges([string]$DocumentPath) {
     foreach ($path in $paths) {
         if (-not $script:documents.ContainsKey($path)) { $changed = $true; continue }
         $state = Get-ReaderFileState $path
+        if ($state.state -eq 'error' -and $script:documents[$path].missing -eq $true) { continue }
         $fingerprint = [string]$state.sourceHash + '|' + [string]$state.sourceModified
         $previousFingerprint = [string]$script:documents[$path].sourceHash + '|' + [string]$script:documents[$path].modified
         if ($fingerprint -ne $previousFingerprint -and $script:observedChanges[$path] -ne $fingerprint) {

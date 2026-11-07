@@ -32,11 +32,93 @@ Eine wachsende Themenuebersicht zeigt zusaetzlich pro Thema Dokumentanzahl als B
 
 Beim Aktualisieren bleibt der bisherige Index sichtbar und wird erst nach erfolgreicher Pruefung ersetzt. Ein gemeldeter Indexierungsfehler laesst ihn unveraendert; bei Verbindungsverlust werden interne Inhalte weiterhin entfernt. Kurze Statusabfragen ersetzen den bisherigen blockierenden Drei-Minuten-Request. Trennen beendet auch einen laufenden Hintergrundauftrag und leert Fortschrittsdaten und Protokoll.
 
+## Wissensbasis-Client — Flurgenossenschaft-Pilot
+
+Die bestehende App kann den vorhandenen zentralen Store als Client lesen. Der Dienst startet dabei **ohne Verzeichnisscan**; die Oberflaeche ruft ausschliesslich die lokale `wb`-Zugriffsschicht auf. Die App oeffnet keine SQLite-Datei und liest keine Store-Datei direkt.
+
+```powershell
+# Einmalig nach einer Codeaenderung: Build aus map.template.html
+& .\themenlandkarte\publish.ps1
+
+# Vorschau, falls noch nicht gestartet
+& .\themenlandkarte\preview.ps1
+
+# In einem zweiten Terminal: Store-Client statt Verzeichnisindex
+& .\themenlandkarte\connector.ps1 `
+  -Origin http://127.0.0.1:43128 `
+  -WissensbasisConfig C:\AI-OS-Pilot\flurgenossenschaft\config.json
+```
+
+Danach `http://127.0.0.1:43128` oeffnen, **AI-OS verbinden** waehlen und auf der lokalen Freigabeseite **Wissensbasis verbinden** bestaetigen.
+
+Die Kopfzeile zeigt **Echte Daten** mit Store-Pfad und Index-Build oder ausdruecklich **Beispieldaten**. Die Wissensbasis oeffnet beim Einstieg die Seite **Sanierung: Kosten, Honorar, Etappierung, Retention**.
+
+Die Hauptansicht ist dreispaltig:
+
+- **Links:** Themenbaum mit den vier kanonischen Wissensseiten und der Trefferliste der Suche.
+- **Mitte:** lesbare Wissensseite mit einem Status, Aktionen und aufklappbaren Details für technische IDs, Fassung und Belegbasis; der Bestätigungsverlauf öffnet über **Bestätigt · Verlauf ansehen** beziehungsweise **Verlauf ansehen**.
+- **Rechts:** Fragebereich dauerhaft oben mit **Frage abschicken** und Info-Schaltfläche; darunter **Quellen** mit hervorgehobenem Titel der Wissensseite und den bestehenden Quellen; darunter aufklappbare **Verwandte Wissensseiten**.
+
+### Fragefunktion
+
+Die Fragefunktion nutzt zuerst die vorhandene Volltextsuche im Store (`wb search`) und optional eine konfigurierte KI-Anbindung. Ohne KI antwortet sie mit einem Auszug aus der passenden, als unbestätigt markierten Wissensseite und nennt die Quellenbelege. Mit KI werden die abgerufenen Belegstellen als Kontext übergeben. Jede Antwort nennt abrufbare Belege (Datei, Fassung, Seite/Zeichenstelle); fehlende Informationen werden ausdrücklich ausgewiesen. Folgefragen berücksichtigen den bisherigen Verlauf (max. 12 Beiträge im UI, 6 im Prompt). Es sind keine Antworten fest hinterlegt.
+
+Ablauf: Frage im rechten Bereich eingeben, **Frage abschicken**. Belege in der Antwort öffnen den Belegdialog; **Original abrufen** lädt die Datei über `wb original`. Im Retrieval-Modus ist die Antwort ausdrücklich als Auszug aus einer `needs_review`-Seite gekennzeichnet. Die lange Erklärung zur KI-/Retrieval-Nutzung liegt hinter der Info-Schaltfläche.
+
+Eine KI-Anbindung ist optional:
+
+```powershell
+$env:DEEPSEEK_API_KEY = '...'
+& .\themenlandkarte\connector.ps1 `
+  -Origin http://127.0.0.1:43128 `
+  -WissensbasisConfig C:\AI-OS-Pilot\flurgenossenschaft\config.json `
+  -AiConfig C:\AI-OS-Pilot\flurgenossenschaft\ai.example.json
+```
+
+Unterstützt werden OpenAI-kompatible Endpunkte (`/chat/completions`) und Ollama (`/api/chat`); Schema `wb/ai/v1`. Ohne `-AiConfig` prüft der Connector `DEEPSEEK_API_KEY`/`OPENAI_API_KEY`; ohne Schlüssel bleibt der Retrieval-Modus aktiv. **Mit externer KI werden die abgerufenen Belegstellen an den konfigurierten Anbieter gesendet.** Das ist eine bewusste Freigabe und nicht Standard; für vertrauliche Inhalte ist ein lokaler Ollama-Endpunkt vorzuziehen. Für den dokumentierten Test ist DeepSeek lokal über `DEEPSEEK_API_KEY` konfiguriert; Ergebnisse und Grenzen stehen in `reports\KI-TEST-DEEPSEEK.md`. Schlüsselwerte werden weder angezeigt noch im Repository gespeichert.
+
+Fünf fachliche Fragen und die Ergebnisse stehen in `C:\AI-OS-Pilot\flurgenossenschaft\reports\ask-five-ai.json` und `ask-five-ai-full.json`; der DeepSeek-Test ist in `reports\KI-TEST-DEEPSEEK.md` dokumentiert. Wiederholbar mit `.\themenlandkarte\test-five-questions.ps1` (Connector muss laufen).
+
+Der Fragebereich zeigt jede abgesendete Frage dauerhaft direkt über ihrer Antwort; die neueste Frage steht oben. Während der Verarbeitung erscheinen Frage und **„Antwort wird erstellt …“** sofort; bei einem Fehler bleiben Frage und ein **Erneut senden**-Knopf erhalten. Frühere Paare bleiben bei Folgefragen stehen, jedes mit seiner eigenen Belegzuordnung. Quellenverweise wie `[E1]`, `(E1)` oder `E1` sind anklickbar und öffnen die Belegstelle mit hervorgehobener Zeichenspanne. Belege werden mit Dokumenttitel und Seite beschriftet; gefundene Rohtexte stehen pro Antwort in einem aufklappbaren Bereich. Antworten mit Markdown-Tabellen und Listen werden als Tabellen/Listen dargestellt.
+
+**Architektur** ist eine eigene, rein lesende Ansicht innerhalb der App. Eine Übersicht zeigt die vier Schichten **Oberfläche, Zugriff, Logik, Daten** als verbundenes Systembild mit beschrifteten Datenflüssen; darunter erklären die Schichten ihre Komponenten im Detail. Statuswerte unterscheiden **Aktiv**, **Nicht verbunden**, **Nicht eingerichtet**, **Geplant** und **Unbekannt**. Komponenten sind anklickbar und erklären Aufgabe, Lese-/Schreibzugriffe sowie lokale oder externe Verarbeitung. Adressen und Datenstände stammen aus der aktuellen Sitzung; interne Pfade erscheinen erst nach autorisierter Verbindung, Zugangsdaten nie.
+
+**Quellen zur Wissensseite** stehen rechts in einem eigenen, vom Chat getrennten Bereich. Der Quellenkopf nennt nur die Anzahl der **Quelldokumente**. Jedes Dokument erscheint mit sprechendem Titel und der **verwendeten Seitenangabe**, zum Beispiel **Budget 2024/2025 · S. 1** oder **HV43 Protokoll 2025 · S. 4–6**. Darunter stehen **Verwendete Seiten** als deduplizierte Bereiche; **Verwendete Fundstellen** öffnen ausschliesslich die für diese Wissensseite belegten Seiten/Abschnitte. **Gesamtes Dokument ansehen** öffnet den vollständigen ausgelesenen Text, **Original öffnen** die hashgeprüfte RAW-Datei. Kennung, Inhalts-Hash, Pfad und Fassungs-ID stehen unter **Details**. Der Belegdialog zeigt die Kette **Originalquelle aus RAW → ausgelesene Seite/Abschnitt → zugehörige Wissensseite**. Der Store führt kein separates Dokumenttitel-Feld; die Anzeige verwendet eine vorhandene Abschnittsüberschrift mit Dokumentkennung, sonst den Dateinamen. Zitate im Seitentext sind direkt anklickbar. **Quellen & Betrieb** enthält zusätzlich eine globale Ansicht nach Wissensseiten; gemeinsam verwendete Quellen erscheinen unter jeder Seite. Quellen einer Chatantwort stehen separat unter **„Für diese Antwort verwendet“** und können von den Seitenquellen abweichen.
+
+**Bearbeiten und Bestätigen** sind getrennte Vorgänge. **Wissensseite bearbeiten** öffnet einen Texteditor für die aktuelle Fassung. Beim Speichern legt der Connector über die vorhandene `wb`-Versionierung (`wb knowledge revise`) eine **neue Fassung** an; Titel und Seiten-ID bleiben unverändert, die bisherige Fassung und ihre Bestätigung bleiben erhalten und die neue Fassung steht auf **Zu bestätigen**. Die Belegbasis wird beim Speichern technisch gegen den geladenen Stand geprüft. **Ansicht aktualisieren** liest dagegen nur den Store neu und legt keine Fassung an.
+
+**Fachlich bestätigen** ist im `leader`-Modus ein einstufiger Dialog mit vier verpflichtenden Prüfpunkten, darunter ausdrücklich: „Ich habe diese Fassung und ihre Belegzuordnungen geprüft. Die Bestätigung ist keine Genehmigung der beschriebenen Vorhaben.“ Die Notiz ist optional; die Identität stammt aus der Store-Anmeldung (`owner`) und wird nicht als Freitext erfasst. Fehlende Prüfpunkte werden vor dem Absenden als **„Noch N Prüfpunkte offen“** am Prüfbereich und im Dialog benannt. Der Server prüft Anzahl und Basis-Hash erneut und ruft `wb review confirm` auf; bei Änderungen wird die Bestätigung erneut prüfbedürftig (`confirmation_stale`).
+
+**Überarbeitung anfordern** ist ein eigener Dialog ohne Prüfpunkte. Eine konkrete Begründung ist Pflicht; fehlt sie, erscheint der Fehler direkt am Feld. Der Server ruft `wb review reject` auf. Beide Dialoge behalten Eingaben bei Validierungsfehlern. **Verlauf ansehen** öffnet den chronologischen Bestätigungsverlauf mit Datum, Identität, verständlicher Fassungsnummer und Begründung; technische IDs stehen unter **Details**, ältere Fassungen sind direkt lesbar. Eine bestätigte Fassung bleibt auch nach einer Überarbeitung nachweisbar; die neue Fassung muss erneut bestätigt werden. Keine automatische Bestätigung durch die KI, kein Sammel-Confirm.
+
+Die linke Leiste zeigt pro Wissensseite **Bestätigt / Zu bestätigen / Überarbeitung nötig / Überholt** mit Datum und Identität; die Seiten sind direkt anklickbar. Bestätigt wird die Wissensseite als Ganzes, nicht jeder Beleg einzeln.
+
+Verknuepfungen stammen aus vorhandenen Belegen (gemeinsame Fassung) oder werden als **automatisch vorgeschlagen** markiert; es werden keine neuen Inhalte oder bestaetigten Beziehungen erfunden.
+
+**Quellen & Betrieb** ist der separate Bereich fuer Quellenstatus, Auswertungsregister, Element-/Fassungsliste und Originalzugriff. Die frueheren Tabs **Quellen** und **Auswertung** werden im Store-Modus ausgeblendet; die Ansicht ist schreibgeschuetzt.
+
+Ablauf `Strassensanierung → Wissensseite → Beleg → Originalstelle`:
+
+1. Im Suchfeld **Strassensanierung** eingeben (oder `?q=Strassensanierung` oeffnen).
+2. In den Treffern die Wissensseite **Sanierung: Kosten, Honorar, Etappierung, Retention** waehlen.
+3. Unter **Quellen** eine Quelle oder in einem Belegtreffer **Beleg** waehlen.
+4. Im Dialog **Belegstelle** Datei, Fassung, Seite und den extrahierten Text pruefen; bei Suchtreffern wird die exakte Zeichenstelle angezeigt.
+5. **Originaldatei abrufen** laedt die Datei ueber die `wb`-Zugriffsschicht aus RAW (Hash-Pruefung). Der Belegdialog zeigt extrahierten Text, keine Originalbytes.
+
+Direkte Links nach der Verbindung:
+
+- `?q=<suchbegriff>` startet die Suche.
+- `?view=kbmap` oeffnet die visuelle Themenkarte.
+- `?view=operations` oeffnet **Quellen & Betrieb**.
+- `?evidence=<version-id>&page=<seite>` oeffnet den Belegdialog.
+
+**Nicht implementiert:** semantische Suche. Die Ansicht zeigt extrahierten Text, keine Originalbytes. Die Wissensseiten-Bearbeitung legt neue Fassungen über `wb knowledge revise` an; die Suche wird dabei nicht automatisch neu indexiert.
+
 ## Dokumentleser Und Volltextsuche
 
 Dokumenttitel, Dateipfade und belegte Suchauszuege oeffnen einen rechten Leser, ohne Themenauswahl und aktuelle Suche zurueckzusetzen. Auf schmalen Bildschirmen nutzt der Leser die gesamte Breite; die Uebersicht bleibt im Hintergrund erhalten. Der Leser bietet Ueberschriftennavigation, eigene Suche mit hervorgehobenen Treffern und Trefferwechsel sowie Textbereichswechsel fuer grosse Inhalte. Er stellt nur Text dar, fuehrt keine importierten Skripte aus und laedt keine Bilder oder externen Links aus Dokumenten.
 
-Die Hauptsuche durchsucht zusaetzlich die tatsaechlich gelesenen lokalen Volltexte. Treffer enthalten exakte Auszuege und Zeichenpositionen; nicht gelesene Inhalte liefern keine Volltextbelege. Metadaten-/Themenbelegtreffer bleiben separat moeglich. Pro Anfrage gelten maximal 300 Zeichen und 12 Suchwoerter; pro Dokument werden bis zu drei Textauszuege bereitgestellt. Keine KI-Zusammenfassungen oder erfundenen Antworten.
+Die Hauptsuche durchsucht zusaetzlich die tatsaechlich gelesenen lokalen Volltexte. Treffer enthalten exakte Auszuege und Zeichenpositionen; nicht gelesene Inhalte liefern keine Volltextbelege. Metadaten-/Themenbelegtreffer bleiben separat moeglich. Pro Anfrage gelten maximal 300 Zeichen und 12 Suchwoerter; pro Dokument werden bis zu drei Textauszuege bereitgestellt. Im Verzeichnismodus gibt es keine KI-Zusammenfassungen; die optionale KI-Anbindung des Wissensbasis-Clients ist oben getrennt beschrieben.
 
 **In VS Code bearbeiten** oeffnet freigegebene Textformate nach ausdruecklichem Klick in der lokal installierten VS-Code-Anwendung. **In zugehoeriger Anwendung oeffnen** verwendet nach ausdruecklichem Klick die lokale Standardanwendung. Es gibt keinen eingebauten Editor und keine Schreibschnittstelle fuer Dokumentinhalte. Beide Aktionen laufen als authentifizierter POST ueber die lokale Verbindung; Statusabfragen starten niemals eine Anwendung. Geaenderte, aber weiterhin freigegebene Originale duerfen zum Korrigieren geoeffnet werden.
 

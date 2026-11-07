@@ -2,22 +2,37 @@ $ErrorActionPreference = 'Stop'
 $port = 43129
 $origin = 'https://example.github.io'
 $base = "http://127.0.0.1:$port"
-$fixture = Join-Path $env:TEMP ('ai-os-service-fixture-' + [guid]::NewGuid().ToString('N'))
+$work = Join-Path $env:TEMP ('ai-os-service-work-' + [guid]::NewGuid().ToString('N'))
+$fixture = Join-Path $work 'first'
+$second = Join-Path $work 'second'
+$missing = Join-Path $work 'missing'
 [IO.Directory]::CreateDirectory($fixture) | Out-Null
+[IO.Directory]::CreateDirectory($second) | Out-Null
 Get-ChildItem (Join-Path $PSScriptRoot 'tests/fixture') -File | Copy-Item -Destination $fixture
+[IO.File]::WriteAllText((Join-Path $second 'notiz.md'), "# Zweite Quelle`nPRIVATE_NOTE_519", [Text.UTF8Encoding]::new($false))
+$configPath = Join-Path $work 'config\sources.json'
+[IO.Directory]::CreateDirectory((Split-Path $configPath -Parent)) | Out-Null
+$initialConfig = @{ version = 1; computerId = 'test-computer'; computerName = 'TEST-PC'; sources = @(@{ id = 'fixture'; name = 'Fixture'; space = 'business'; type = 'directory'; path = $fixture; read = $true; write = $true; flat = $true }) }
+[IO.File]::WriteAllText($configPath, ($initialConfig | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
 $process = [System.Diagnostics.Process]::new()
 $process.StartInfo.FileName = 'powershell.exe'
-$process.StartInfo.Arguments = '-NoProfile -File "' + (Join-Path $PSScriptRoot 'connector.ps1') + '" -Origin ' + $origin + ' -Port ' + $port + ' -Root "' + $fixture + '"'
+$process.StartInfo.Arguments = '-NoProfile -File "' + (Join-Path $PSScriptRoot 'connector.ps1') + '" -Origin ' + $origin + ' -Port ' + $port + ' -ConfigurationPath "' + $configPath + '"'
 $process.StartInfo.UseShellExecute = $false
 $process.StartInfo.RedirectStandardOutput = $true
 $process.StartInfo.CreateNoWindow = $true
 
-function Request([string]$path, [string]$method = 'GET', [hashtable]$headers = @{}) {
+function Request([string]$path, [string]$method = 'GET', [hashtable]$headers = @{}, [string]$body = '') {
     $request = [System.Net.HttpWebRequest]::Create($base + $path)
     $request.Method = $method
     $request.Timeout = 60000
-    if ($method -eq 'POST') { $request.ContentLength = 0 }
+    $request.ContentType = 'application/json; charset=utf-8'
     foreach ($key in $headers.Keys) { $request.Headers[$key] = $headers[$key] }
+    if ($body) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+        $request.ContentLength = $bytes.Length
+        $stream = $request.GetRequestStream()
+        try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+    } elseif ($method -eq 'POST') { $request.ContentLength = 0 }
     try { $response = $request.GetResponse() } catch [System.Net.WebException] {
         $response = $_.Exception.Response
         if (-not $response) { throw }
@@ -27,6 +42,16 @@ function Request([string]$path, [string]$method = 'GET', [hashtable]$headers = @
     finally { $reader.Dispose(); $response.Close() }
 }
 function Assert($condition, [string]$message) { if (-not $condition) { throw $message } }
+function Wait-Refresh([hashtable]$headers) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    do {
+        $state = (Request '/progress' 'GET' $headers).body | ConvertFrom-Json
+        Assert ($state.state -ne 'failed') ('Hintergrundauftrag fehlgeschlagen: ' + $state.error + ' / ' + $state.errorId)
+        Assert ([DateTime]::UtcNow -lt $deadline) 'Hintergrundauftrag laeuft zu lange'
+        Start-Sleep -Milliseconds 200
+    } while ($state.state -ne 'completed')
+    $state
+}
 . (Join-Path $PSScriptRoot 'document-state.ps1')
 
 $buildAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'build.ps1'), [ref]$null, [ref]$null)
@@ -99,7 +124,7 @@ try {
         Assert ($progress.state -ne 'failed') ('Hintergrundauftrag fehlgeschlagen: ' + $progress.errorId)
         Assert ([DateTime]::UtcNow -lt $deadline) 'Hintergrundauftrag laeuft zu lange'
     } while ($progress.state -ne 'completed')
-    Assert ($progress.phase -eq 5 -and $progress.processed -eq $progress.total -and $progress.evaluated -eq 1) 'Abschlusszaehler falsch'
+    Assert ($progress.phase -eq 5 -and $progress.processed -eq $progress.total -and $progress.evaluated -eq 1) ('Abschlusszaehler falsch: ' + ($progress | ConvertTo-Json -Depth 2 -Compress))
     Assert ($progress.topicsFound -eq 2 -and $progress.topicCandidates -eq 19 -and $progress.topicLabels.Count -eq 2) 'Themenzaehler oder Themenliste falsch'
     $expectedReferences = if ($progress.partial -gt 0) { 0 } else { 2 }
     $expectedTopicDocuments = if ($progress.partial -gt 0) { 1 } else { 2 }
@@ -176,6 +201,70 @@ try {
     $missingSearch = (Request '/search?q=AUTO_RELOADED_TOKEN_815' 'GET' $auth).body | ConvertFrom-Json
     Assert ($missingSearch.results.Count -eq 0) 'Entfernte Datei wird weiter als aktueller Suchtreffer angeboten'
     [IO.File]::WriteAllText($samplePath, $sampleText, [Text.UTF8Encoding]::new($false))
+    Assert ((Request '/sources' 'GET' @{ Origin = $origin }).status -eq 403) 'Quellen ohne Token lesbar'
+    $sourceState = (Request '/sources' 'GET' $auth).body | ConvertFrom-Json
+    Assert ($sourceState.sourceEditing -eq $true -and @($sourceState.sources).Count -eq 1) 'Quellenregister oder Bearbeitungsrecht falsch'
+    Assert ($sourceState.computer.id -eq 'test-computer' -and $sourceState.computer.name -eq 'TEST-PC') 'Rechnerkennung fehlt im Quellenregister'
+    $fixtureProbe = @($sourceState.sources)[0]
+    Assert ($fixtureProbe.id -eq 'fixture' -and $fixtureProbe.name -eq 'Fixture' -and $fixtureProbe.space -eq 'business' -and $fixtureProbe.type -eq 'directory') 'Quellenmetadaten unvollstaendig'
+    Assert ($fixtureProbe.read -eq $true -and $fixtureProbe.write -eq $true -and $fixtureProbe.reachable -eq 'reachable') 'Rechte oder Erreichbarkeit der Quelle falsch'
+    Assert ($fixtureProbe.lastSuccess -and $null -ne $fixtureProbe.pending -and $fixtureProbe.updateState -in @('current', 'error')) ('Quellenzustand nicht tatsaechlich ermittelt: ' + ($fixtureProbe | ConvertTo-Json -Depth 4 -Compress))
+    $tokenField = Request '/sources/save' 'POST' $auth (@{ name = 'X'; space = 'private'; type = 'directory'; path = $second; read = $true; write = $false; token = 'geheim' } | ConvertTo-Json -Compress)
+    Assert ($tokenField.status -eq 400 -and $tokenField.body.Contains('Unbekanntes Feld')) 'Zugangsdaten ueber die App speicherbar'
+    Assert (-not [IO.File]::ReadAllText($configPath).Contains('geheim')) 'Zugangsdaten in lokaler Konfiguration abgelegt'
+    $relativePath = Request '/sources/save' 'POST' $auth (@{ name = 'Rel'; space = 'private'; type = 'directory'; path = 'relativ\pfad'; read = $true; write = $false } | ConvertTo-Json -Compress)
+    Assert ($relativePath.status -eq 400) 'Relativer Quellenpfad akzeptiert'
+    $writeWithoutRead = Request '/sources/save' 'POST' $auth (@{ name = 'OhneLesen'; space = 'private'; type = 'directory'; path = $second; read = $false; write = $true } | ConvertTo-Json -Compress)
+    Assert ($writeWithoutRead.status -eq 400) 'Schreibrecht ohne Leserecht akzeptiert'
+    $saved = Request '/sources/save' 'POST' $auth (@{ name = 'Privat'; space = 'private'; type = 'onedrive'; path = $second; read = $true; write = $false } | ConvertTo-Json -Compress)
+    Assert ($saved.status -eq 202) ('Quelle speichern fehlgeschlagen: ' + $saved.body)
+    $savedSource = ($saved.body | ConvertFrom-Json).source
+    $secondId = $savedSource.id
+    Assert ($secondId -match '^[a-zA-Z0-9][a-zA-Z0-9_-]{1,63}$' -and $savedSource.space -eq 'private' -and $savedSource.write -eq $false) 'Gespeicherte Quelle falsch'
+    $null = Wait-Refresh $auth
+    $sourceSession = (Request '/session' 'GET' $auth).body | ConvertFrom-Json
+    Assert (@($sourceSession.inventory.sources).Count -eq 2 -and $sourceSession.sourceEditing -eq $true) 'Zweite Quelle nicht uebernommen'
+    $fixtureFile = $sourceSession.inventory.files | Where-Object { $_.path -eq 'sample.md' }
+    Assert ($fixtureFile.sourceId -eq 'fixture' -and $fixtureFile.space -eq 'business' -and $fixtureFile.citation.path -eq 'sample.md' -and $fixtureFile.citation.hash -eq $fixtureFile.hash) 'Quellenbeleg pro Dokument fehlt'
+    $citationDocument = (Request '/document?path=sample.md' 'GET' $auth).body | ConvertFrom-Json
+    Assert ($citationDocument.source.name -eq 'Fixture' -and $citationDocument.citation.sourceId -eq 'fixture' -and $citationDocument.canEditInCode -eq $true) 'Dokument nennt Quelle, Beleg oder Schreibrecht nicht'
+    $secondFile = $sourceSession.inventory.files | Where-Object { $_.sourceId -eq $secondId }
+    Assert (@($secondFile).Count -eq 1 -and $secondFile.path -eq ($secondId + '/notiz.md') -and $secondFile.space -eq 'private') 'Pfadpraefix oder Wissensraum der zweiten Quelle falsch'
+    Assert ($secondFile.citation.path -eq 'notiz.md' -and $secondFile.citation.sourceId -eq $secondId) 'Beleg der zweiten Quelle falsch'
+    $secondDocument = (Request ('/document?path=' + [Uri]::EscapeDataString($secondId + '/notiz.md')) 'GET' $auth).body | ConvertFrom-Json
+    Assert ($secondDocument.source.name -eq 'Privat' -and $secondDocument.space -eq 'private' -and $secondDocument.canEditInCode -eq $false) 'Leserecht der zweiten Quelle falsch'
+    $secondSearch = (Request '/search?q=PRIVATE_NOTE_519' 'GET' $auth).body | ConvertFrom-Json
+    Assert (@($secondSearch.results).Count -eq 1 -and $secondSearch.results[0].citation.sourceId -eq $secondId -and $secondSearch.results[0].source.name -eq 'Privat') 'Volltexttreffer ohne Quellenbeleg'
+    $secondNote = Join-Path $second 'notiz.md'
+    [IO.File]::WriteAllText($secondNote, "# Zweite Quelle`nPRIVATE_NOTE_519 AUTO_SECOND_380", [Text.UTF8Encoding]::new($false))
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    do {
+        $secondSaveState = (Request '/status' 'GET' $auth).body | ConvertFrom-Json
+        Assert ([DateTime]::UtcNow -lt $deadline) 'Automatisches Neueinlesen der zweiten Quelle laeuft zu lange'
+    } while ($secondSaveState.processing)
+    $secondAfterSave = (Request ('/document?path=' + [Uri]::EscapeDataString($secondId + '/notiz.md')) 'GET' $auth).body | ConvertFrom-Json
+    Assert ($secondAfterSave.text.Contains('AUTO_SECOND_380')) 'Aenderung in der zweiten Quelle wird nicht automatisch eingelesen'
+    $unreachable = Request '/sources/save' 'POST' $auth (@{ name = 'Nirgends'; space = 'business'; type = 'network'; path = $missing; read = $true; write = $false } | ConvertTo-Json -Compress)
+    Assert ($unreachable.status -eq 202) 'Nicht erreichbare Quelle nicht speicherbar'
+    $unreachableId = ($unreachable.body | ConvertFrom-Json).source.id
+    $null = Wait-Refresh $auth
+    $unreachableState = (Request '/sources' 'GET' $auth).body | ConvertFrom-Json
+    $unreachableProbe = $unreachableState.sources | Where-Object { $_.id -eq $unreachableId }
+    Assert ($unreachableProbe.reachable -eq 'unreachable' -and $null -eq $unreachableProbe.lastSuccess -and $null -eq $unreachableProbe.pending -and $unreachableProbe.updateState -eq 'unknown') 'Unbekannter Zustand nicht als unbekannt gemeldet'
+    Assert ($unreachableProbe.error) 'Fehler der nicht erreichbaren Quelle fehlt'
+    $removed = Request '/sources/remove' 'POST' $auth (@{ id = $secondId } | ConvertTo-Json -Compress)
+    Assert ($removed.status -eq 202) 'Quelle entfernen fehlgeschlagen'
+    $null = Wait-Refresh $auth
+    $removedSession = (Request '/session' 'GET' $auth).body | ConvertFrom-Json
+    Assert (@($removedSession.inventory.sources).Count -eq 2 -and -not ($removedSession.inventory.files | Where-Object { $_.sourceId -eq $secondId })) 'Entfernte Quelle bleibt im Index'
+    Assert ((Request '/sources/remove' 'POST' $auth (@{ id = $unreachableId } | ConvertTo-Json -Compress)).status -eq 202) 'Zweite Quelle nicht entfernbar'
+    $null = Wait-Refresh $auth
+    $lastRemoval = Request '/sources/remove' 'POST' $auth (@{ id = 'fixture' } | ConvertTo-Json -Compress)
+    Assert ($lastRemoval.status -eq 400 -and $lastRemoval.body.Contains('Mindestens eine Quelle')) 'Letzte Quelle entfernbar'
+    $finalConfig = [IO.File]::ReadAllText($configPath)
+    Assert (-not $finalConfig.Contains('geheim') -and -not $finalConfig.Contains('PRIVATE_NOTE_519')) 'Zugangsdaten oder Volltext in lokaler Konfiguration'
+    Assert ($finalConfig -match '"id"\s*:\s*"fixture"') 'Stabile Quellen-ID nicht gespeichert'
+    Assert (-not $configPath.StartsWith($PSScriptRoot, [StringComparison]::OrdinalIgnoreCase)) 'Quellenkonfiguration liegt im Repository'
     Assert ((Request '/session' 'GET' @{ Origin = 'https://untrusted.example'; Authorization = 'Bearer ' + $secret }).status -eq 403) 'Token fuer fremden Ursprung akzeptiert'
     Assert ((Request '/progress' 'GET' @{ Origin = $origin }).status -eq 403) 'Aktualisierungsfortschritt ohne Token lesbar'
     Assert ((Request '/refresh' 'POST' $auth).status -eq 202) 'Aktualisieren startet keinen Hintergrundauftrag'
@@ -210,11 +299,15 @@ try {
     Assert (-not $html.Contains('FULLTEXT_ONLY_NEEDLE_742')) 'Privater Volltext im Public-Build'
     Assert ($html.Contains('topic-build-table') -and -not $html.Contains('__TOPIC_BUILD__')) 'Visueller Themenaufbau im Public-Build fehlt'
     Assert ($html.Contains('In VS Code bearbeiten') -and $html.Contains('Europe/Zurich') -and $html.Contains('Letzte erfolgreiche Auswertung') -and $html.Contains('pollConnection')) 'Editoraktion, Zeitzone oder getrennte Staende fehlen'
-    Write-Output 'TESTS_OK: CORS, Preflight, Origin, Token, lokale Freigabe, Index, Aktualisieren, Widerruf, Public-Isolation.'
+    Assert ($html.Contains('id="workspace-computer"') -and $html.Contains('id="workspace-space"') -and $html.Contains('Letzter Abgleich') -and $html.Contains('Aktiver Wissensraum')) 'Rechner-, Wissensraum- oder Abgleichsanzeige fehlt im Public-Build'
+    Assert ($html.Contains('data-view="sources"') -and $html.Contains('renderSources') -and $html.Contains('source-facts') -and $html.Contains('Stabile ID')) 'Quellenansicht fehlt im Public-Build'
+    Assert ($html.Contains('id="source-dialog"') -and $html.Contains("request('/sources/save'") -and $html.Contains("'/sources/remove'")) 'Quellenverwaltung fehlt im Public-Build'
+    Assert ($html.Contains('Unbekannt (noch kein Indexstand)') -and $html.Contains('als Unbekannt angezeigt')) 'Unbekannte Zustaende nicht ausdruecklich gekennzeichnet'
+    Assert ($html.Contains('Zugangsdaten bleiben in der lokalen Konfiguration') -and -not $html.Contains('PRIVATE_NOTE_519')) 'Zugangsdatenhinweis fehlt oder privater Inhalt veroeffentlicht'
+    Write-Output 'TESTS_OK: CORS, Preflight, Origin, Token, lokale Freigabe, Index, Quellenverwaltung, Wissensraeume, Aktualisieren, Widerruf, Public-Isolation.'
 } finally {
     if ($process.Id -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
     $process.Dispose()
-    if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
-    $fixtureHistory = Get-ReaderHistoryPath $fixture
-    if (Test-Path -LiteralPath $fixtureHistory) { Remove-Item -LiteralPath $fixtureHistory -Force }
+    foreach ($directory in @($fixture, $second)) { $history = Get-ReaderHistoryPath $directory; if (Test-Path -LiteralPath $history) { Remove-Item -LiteralPath $history -Force } }
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 }
